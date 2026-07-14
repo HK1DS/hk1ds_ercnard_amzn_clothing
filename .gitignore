@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Secrets
+.env
+.envrc
+
+# Local Codex/session metadata
+.agents/
+
+# Local legacy experiment snapshot (reference only)
+legacy/
+
+# Data and generated artifacts
+data/
+run/
+run_k*/
+run_*/
+log/
+log_tensorboard/
+checkpoints/
+saved/
+*.pth
+*.pt
+*.npy
+*.ann
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Build/package
+build/
+dist/
+*.egg-info/

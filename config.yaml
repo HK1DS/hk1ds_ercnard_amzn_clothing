@@ -1,0 +1,61 @@
+# Generic IKGR -> DynLLM -> CORONA vanilla pipeline configuration.
+# Update paths and LLM provider values for your dataset/environment.
+
+paths:
+  # Required columns:
+  # - profiles: user_id,user_profile,item_id,item_profile
+  # - interactions: user_id,item_id,rating[,timestamp]
+  # - metadata (optional): item_id plus author/publisher/category/tag columns
+  input_csv: data/profiles.csv
+  inter_file: data/interactions.csv
+  meta_file: data/item_metadata.csv
+
+  workdir: run/
+  step1_output: run/step1_intents.csv
+  step2_output: run/step2_related_intents.csv
+  kg_triples: run/kg_triples.txt
+  recbole_dump: run/recbole/
+  user_bank_pt: run/user_bank.pt
+  item_bank_pt: run/item_bank.pt
+  kg_pack: run/kg_pack.pt
+  meta_kg_pack: run/meta_kg_pack.pt
+
+llm:
+  # Default: Luxia Cloud OpenAI-compatible GPT-4o-mini bridge.
+  # Put the actual key in .env, not in this file.
+  base_url: https://bridge.luxiacloud.com/llm/openai/chat/completions/gpt-4o-mini
+  api_key: "${LUXIA_API_KEY}"
+  model: "llm"
+  provider: luxia
+  temperature: 0.2
+  top_p: 0.95
+  max_tokens: 2048
+
+rag:
+  encoder: "sentence-transformers/all-mpnet-base-v2"
+  annoy_trees: 50
+  knn_k: 100
+  encoding_npy: run/intents_emb.npy
+  annoy_index: run/intents.ann
+  vocab_json: run/intent_vocab.json
+
+recbole:
+  model: "IKGR"
+  dataset: "ikgr-custom"
+  topk: [10, 30]
+  metrics: ["Recall", "MRR", "NDCG", "Hit", "Precision"]
+  epochs: 20
+  embedding_size: 512
+  dropout: 0.1
+
+pipeline:
+  # Evaluation defaults. Use TO only when interactions include timestamp.
+  split: RS
+  seeds: "2020"
+  specs: "IKGR_kgoff,IKGR_kgon_L1_frozen,BPR,LightGCN"
+
+metadata:
+  # Generic CSV metadata columns. Missing columns are ignored.
+  author_cols: ["authors", "author", "brand"]
+  publisher_cols: ["publisher", "publishers", "manufacturer"]
+  tag_cols: ["shelves", "shelf", "categories", "category", "attributes", "attribute"]
