@@ -69,6 +69,9 @@ def _experiment_context(name, model_arg, extra, rb, paths, split):
         "model": model_arg if isinstance(model_arg, str) else model_arg.__name__,
         "split": split,
         "epochs": int(os.environ.get("IKGR_EPOCHS", rb["epochs"])),
+        "embedding_size": int(os.environ.get("IKGR_EMBEDDING_SIZE", rb["embedding_size"])),
+        "learning_rate": float(os.environ.get("IKGR_LEARNING_RATE", "1e-3")),
+        "reg_weight": float(os.environ.get("IKGR_REG_WEIGHT", "1e-6")),
         "extra": extra,
         "paths": paths,
         "recbole": rb,
@@ -96,7 +99,9 @@ def _config(rb, paths, extra, seed):
     cd = {
         "epochs": int(os.environ.get("IKGR_EPOCHS", rb["epochs"])),
         "metrics": rb["metrics"], "topk": rb["topk"],
-        "embedding_size": rb["embedding_size"], "learning_rate": 1e-3, "reg_weight": 1e-6,
+        "embedding_size": int(os.environ.get("IKGR_EMBEDDING_SIZE", rb["embedding_size"])),
+        "learning_rate": float(os.environ.get("IKGR_LEARNING_RATE", "1e-3")),
+        "reg_weight": float(os.environ.get("IKGR_REG_WEIGHT", "1e-6")),
         "dropout_prob": rb.get("dropout", 0.1),
         "data_path": os.path.dirname(paths["inter_file"]),
         "USER_ID_FIELD": "user_id", "ITEM_ID_FIELD": "item_id", "LABEL_FIELD": "rating",
@@ -198,7 +203,10 @@ def _train_and_collect(model_arg, extra, rb, paths, seed):
     train_sec = round(time.time() - t0, 1)
     smf = getattr(trainer, "saved_model_file", None)
     if smf and os.path.exists(smf):
-        ck = torch.load(smf, map_location=config["device"])
+        # RecBole checkpoints contain optimizer/config objects in addition to
+        # tensors. PyTorch >=2.6 defaults weights_only=True, which rejects this
+        # trusted checkpoint created moments earlier by this local trainer.
+        ck = torch.load(smf, map_location=config["device"], weights_only=False)
         model.load_state_dict(ck["state_dict"])
         if ck.get("other_parameter"):
             model.load_other_parameter(ck["other_parameter"])

@@ -95,6 +95,55 @@ pipeline:
 
 Use `split: TO` only when `interactions.csv` includes `timestamp`.
 
+### Prepare Amazon Clothing 2018
+
+After downloading the two official gzip JSONL files under
+`data/amazon_clothing/raw/`, build a deterministic, affordable experiment
+sample without loading either raw file fully into memory:
+
+```bash
+python prepare_amazon_clothing.py --users 5000 --user-k 5 --item-k 3 --min-rating 4
+```
+
+This writes `data/profiles.csv`, `data/interactions.csv`, and
+`data/item_metadata.csv`. The candidate-user sample is selected by stable hash,
+then positive interactions are iteratively filtered to a user/item k-core.
+
+## Amazon Clothing Smoke Experiment (2026-08-04)
+
+The following is a reproducibility snapshot, **not a claim about the full
+Amazon Clothing dataset**. It used the deterministic sample created with:
+
+```bash
+python prepare_amazon_clothing.py --users 5000 --user-k 5 --item-k 3 --min-rating 4
+```
+
+This produced 2,998 positive interactions from 292 users and 275 items. We
+used a per-user time-ordered split (`TO`), 30 epochs, and seeds
+`2020,2021,2022`. Scores are mean ± standard deviation across seeds.
+
+| model | NDCG@10 | Recall@10 | tail Recall@10 | coverage@10 |
+|---|---:|---:|---:|---:|
+| BPR | 0.0301 ± 0.0028 | 0.0503 | 0.0422 | 0.9976 |
+| LightGCN | 0.0343 ± 0.0054 | 0.0648 | 0.0625 | 0.9988 |
+| IKGR kgoff | 0.0348 ± 0.0055 | 0.0659 | 0.0637 | 0.9988 |
+| IKGR intent KG | 0.0213 ± 0.0034 | 0.0381 | 0.0193 | 0.4582 |
+| IKGR + metadata KG | 0.1121 ± 0.0168 | 0.1682 | 0.1560 | 0.4243 |
+| IKGR DynLLM | 0.3117 ± 0.0307 | 0.4401 | 0.4423 | 0.7054 |
+| IKGR + CORONA soft rerank (λ=0.5) | **0.3753 ± 0.0251** | **0.5079** | **0.5114** | 0.7345 |
+
+The baseline grid searched embedding sizes 32/64/128 and learning rates
+0.0005/0.001. LightGCN selected 128 dimensions and learning rate 0.001; the
+final configuration retains 128 dimensions. In this small sample, intent-only
+KG propagation reduced accuracy and coverage, while metadata and train-only
+recency provided the meaningful gains.
+
+`IKGR_cand_db` is intentionally not listed as a distinct result: its candidate
+count was 500 while this sample contains only 275 items, so it did not restrict
+the ranking catalog and matched DynLLM. Re-evaluate candidate generation with a
+smaller M (for example 50–200) before making a CORONA candidate-retrieval
+claim.
+
 ## Run
 
 Minimal reusable run:
