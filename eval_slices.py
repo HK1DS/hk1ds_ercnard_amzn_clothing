@@ -234,6 +234,7 @@ def _train_and_collect(model_arg, extra, rb, paths, seed, eval_part="test"):
     cand_idf = bool(extra.pop("corona_idf", False))
     cand_popnorm = float(extra.pop("corona_popnorm", 0.0))
     cand_weights = extra.pop("corona_weights", None)
+    strict_train_only_kg = bool(extra.get("train_only_kg", False))
     rerank_lambdas = [float(x) for x in extra.pop("corona_rerank_grid", [])]
     rerank_convex = bool(extra.pop("corona_rerank_convex", False))
     config = Config(model=model_arg, dataset=rb["dataset"], config_dict=_config(rb, paths, extra, seed))
@@ -256,7 +257,8 @@ def _train_and_collect(model_arg, extra, rb, paths, seed, eval_part="test"):
                                     kg_pack_path=extra.get("kg_pack_path"),
                                     meta_kg_path=extra.get("meta_kg_path"),
                                     weights=cand_weights, use_cf=cand_cf,
-                                    idf=cand_idf, pop_norm=cand_popnorm)
+                                    idf=cand_idf, pop_norm=cand_popnorm,
+                                    train_only_kg=strict_train_only_kg)
         mode = f"M={cand_m}" if cand_m > 0 else f"soft_rerank={rerank_lambdas}"
         print(f"  [corona] retriever ready ({mode}, cf={cand_cf}, "
               f"idf={cand_idf}, pop_norm={cand_popnorm})", flush=True)

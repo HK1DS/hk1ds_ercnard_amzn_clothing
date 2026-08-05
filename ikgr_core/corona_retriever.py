@@ -39,7 +39,8 @@ def _binary_csr(rows, cols, shape):
 
 class CoronaRetriever:
     def __init__(self, train_data, config, kg_pack_path=None, meta_kg_path=None,
-                 weights=None, use_cf=True, idf=False, pop_norm=0.0):
+                 weights=None, use_cf=True, idf=False, pop_norm=0.0,
+                 train_only_kg=False):
         ds = train_data.dataset
         self.n_users = int(ds.user_num)
         self.n_items = int(ds.item_num)
@@ -49,6 +50,7 @@ class CoronaRetriever:
         inter = ds.inter_feat
         u = inter[uf].numpy()
         it = inter[itf].numpy()
+        allowed_items = set(map(int, it.tolist())) if train_only_kg else None
 
         # train user-item binary (history) ------------------------------------
         self.UI = _binary_csr(u, it, (self.n_users, self.n_items))
@@ -73,7 +75,8 @@ class CoronaRetriever:
         if kg_pack_path:
             kp = torch.load(kg_pack_path, map_location="cpu")
             n_int = int(kp["n_intents"])
-            IInt = self._tok_node_mat(kp["item_intents"], i_tok2id, self.n_items, n_int)
+            IInt = self._tok_node_mat(kp["item_intents"], i_tok2id, self.n_items, n_int,
+                                      allowed_rows=allowed_items)
             self.UInt = (self.UI @ IInt).tocsr()
             if self.UInt.nnz:
                 self.UInt.data[:] = 1.0
@@ -87,7 +90,8 @@ class CoronaRetriever:
                                     ("item_authors", "n_authors", "author"),
                                     ("item_publishers", "n_publishers", "pub")]:
                 if key in mp:
-                    M = self._tok_node_mat(mp[key], i_tok2id, self.n_items, int(mp[nkey]))
+                    M = self._tok_node_mat(mp[key], i_tok2id, self.n_items, int(mp[nkey]),
+                                           allowed_rows=allowed_items)
                     if M.nnz > 0:
                         self.meta[name] = self._maybe_idf(M)
 
@@ -107,11 +111,13 @@ class CoronaRetriever:
         return (M @ sp.diags(idf)).tocsr()
 
     @staticmethod
-    def _tok_node_mat(d, tok2id, n_rows, n_cols):
+    def _tok_node_mat(d, tok2id, n_rows, n_cols, allowed_rows=None):
         rows, cols = [], []
         for tok, ids in d.items():
             rid = tok2id.get(str(tok))
             if rid is None:
+                continue
+            if allowed_rows is not None and int(rid) not in allowed_rows:
                 continue
             ids = ids.tolist() if torch.is_tensor(ids) else list(ids)
             for j in ids:

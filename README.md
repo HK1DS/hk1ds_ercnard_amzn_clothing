@@ -94,13 +94,10 @@ pipeline:
 ```
 
 Use `split: TO` only when `interactions.csv` includes `timestamp`.
-
 ### Prepare Amazon Clothing 2018
-
 After downloading the two official gzip JSONL files under
 `data/amazon_clothing/raw/`, build a deterministic, affordable experiment
 sample without loading either raw file fully into memory:
-
 ```bash
 python prepare_amazon_clothing.py --users 5000 --user-k 5 --item-k 3 --min-rating 4
 ```
@@ -188,32 +185,6 @@ sample while intentionally trading some catalog coverage for retrieval speed.
 It is not an end-to-end serving benchmark: this repository evaluates the
 offline ranking path and does not yet provide a <10 ms vector-search service.
 
-## Leakage-Controlled Validation/Test Result (superseded audit, 2026-08-05)
-
-The earlier 2026-08-05 adaptive experiments were useful for implementation
-debugging, but their hyperparameters were explored repeatedly on the test
-split. They must therefore not be treated as final test estimates. The result
-below is retained only as historical context and is superseded by the strict
-train-only KG audit that follows.
-
-To avoid look-ahead from preprocessing, the global "within 365 days of each
-user's latest event" filter is disabled for temporal evaluation. That filter
-would otherwise use a future timestamp to decide whether an earlier training
-event enters the dataset. Adaptive recency weights, CORONA user-intent exposure,
-and history masking remain train-only:
-
-- adaptive recency uses the latest timestamp in each seed's training split;
-- CORONA constructs user intent exposure from train user-item history, not LLM
-  user-profile text that can include later reviews;
-- train-history items are masked before every validation/test top-k ranking.
-- the 365-day hard inactivity window is applied only after each seed's train
-  split is created; in this run it retained 2,267 of 2,314 train interactions.
-
-The high rerank score in the historical table is **not a valid headline
-result**: the item-intent KG and category-entropy statistic could still include
-test-item metadata. That is transductive side information, but it does not
-meet the strict train-only protocol.
-
 The data used here contains 2,998 interactions, 292 users, and 275 items. The
 validation grid searched \(\alpha \in \{0.2, 0.3\}\) and
 \(\lambda \in \{0.5, 0.75, 0.9\}\), with \(\gamma=0.99\) and
@@ -246,6 +217,22 @@ interactions / 292 users / 275 items. It confirms that the anomalous 0.87
 score came from the prior/transductive path, not pure GNN ranking. The next
 valid experiment is a strict-mode validation-only \(\lambda\) sweep, followed
 by one locked test evaluation.
+
+## Final Strict Rerun (2026-08-05)
+
+The previous high-score section above is obsolete and should not be used. The
+final strict rerun uses train-only KG and CORONA matrices: test-item intent and
+metadata rows are excluded from every graph-prior computation.
+
+Validation selected \(\lambda=0.75\) from \(\{0, 0.1, 0.25, 0.5, 0.75\}\).
+That setting was locked and evaluated once on test over seeds 2020--2022.
+
+| final strict test model | NDCG@10 | tail Recall@10 | coverage@10 |
+|---|---:|---:|---:|
+| IKGR adaptive gating + strict train-only KG + CORONA (\(\lambda=0.75\)) | **0.3712 ± 0.0077** | **0.3795** | **0.7236** |
+
+Seed NDCG@10 values: 0.3702, 0.3641, 0.3794. This is the only current
+reportable result for this smoke dataset.
 
 ## Run
 
