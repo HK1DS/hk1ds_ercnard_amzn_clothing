@@ -65,13 +65,18 @@ class CoronaRetriever:
         self.use_cf = use_cf
 
         # intent channel: user<->intent, item<->intent ------------------------
+        # Build user intent exposure from TRAIN user-item history, rather than
+        # LLM user-profile text. The latter can contain a review written after
+        # the temporal cutoff and would leak test-period preference into CORONA.
         self.UInt = None
         self.IInt = None
         if kg_pack_path:
             kp = torch.load(kg_pack_path, map_location="cpu")
             n_int = int(kp["n_intents"])
-            self.UInt = self._tok_node_mat(kp["user_intents"], u_tok2id, self.n_users, n_int)
             IInt = self._tok_node_mat(kp["item_intents"], i_tok2id, self.n_items, n_int)
+            self.UInt = (self.UI @ IInt).tocsr()
+            if self.UInt.nnz:
+                self.UInt.data[:] = 1.0
             self.IInt = self._maybe_idf(IInt)
 
         # metadata channels: item<->{shelf,author,publisher} -----------------

@@ -144,6 +144,86 @@ the ranking catalog and matched DynLLM. Re-evaluate candidate generation with a
 smaller M (for example 50–200) before making a CORONA candidate-retrieval
 claim.
 
+## Adaptive Recency-Intent CORONA Experiment (2026-08-05)
+
+This follow-up implements the offline/online design used for the current
+recommended pipeline. Before the k-core, each user's events older than 365 days
+from that user's latest retained event are removed. The resulting deterministic
+smoke dataset contains 2,016 positive interactions, 196 users, and 184 items.
+
+During each evaluation seed, adaptive weights are computed from the **train
+split only** to prevent temporal leakage:
+
+\[
+W_{u,m,i}=\gamma^{\Delta t_{u,i}}\frac{1}{1+\beta H_m},
+\]
+
+where \(\Delta t\) is measured in days from the user's latest training event,
+\(\gamma=0.99\), and \(H_m\) is the entropy of metadata categories associated
+with intent \(m\). The weighted user-to-intent aggregation is then consumed by
+the IKGR/DynLLM model. Category entropy is built offline in `build_kg.py`; the
+time component is built after RecBole creates each train split.
+
+For online-style CORONA coarse retrieval, candidate size is catalog
+proportional:
+
+\[
+M=\min(M_{max},\lfloor\alpha|I|\rfloor),\quad \alpha=0.2,\ M_{max}=500.
+\]
+
+On this 184-item catalog, this yields \(M=36\), followed by model ranking in
+the retrieved set. The `IKGR_adaptive_corona` retriever had candidate recall
+0.9794 at M=36 for seed 2020. Results use the same `TO`, 30-epoch, three-seed
+protocol as the preceding table.
+
+| model | NDCG@10 | Recall@10 | tail Recall@10 | coverage@10 |
+|---|---:|---:|---:|---:|
+| LightGCN | 0.0241 ± 0.0061 | 0.0565 | 0.0580 | 1.0000 |
+| IKGR DynLLM | 0.2625 ± 0.0258 | 0.3663 | 0.3586 | 0.7971 |
+| IKGR adaptive gating + DynLLM | 0.3417 ± 0.0321 | 0.4778 | 0.4692 | 0.8352 |
+| IKGR adaptive gating + CORONA M=36 | **0.4910 ± 0.0287** | **0.6364** | **0.6485** | 0.8044 |
+
+The candidate-restricted model improves ranking and tail recall on this smoke
+sample while intentionally trading some catalog coverage for retrieval speed.
+It is not an end-to-end serving benchmark: this repository evaluates the
+offline ranking path and does not yet provide a <10 ms vector-search service.
+
+## Leakage-Controlled Validation/Test Result (2026-08-05)
+
+The earlier 2026-08-05 adaptive experiments were useful for implementation
+debugging, but their hyperparameters were explored repeatedly on the test
+split. They must therefore not be treated as final test estimates. This final
+pass used a separate validation loader to select candidate ratio and reranking
+weight, then evaluated the selected setting on the test loader once.
+
+To avoid look-ahead from preprocessing, the global "within 365 days of each
+user's latest event" filter is disabled for temporal evaluation. That filter
+would otherwise use a future timestamp to decide whether an earlier training
+event enters the dataset. Adaptive recency weights, CORONA user-intent exposure,
+and history masking remain train-only:
+
+- adaptive recency uses the latest timestamp in each seed's training split;
+- CORONA constructs user intent exposure from train user-item history, not LLM
+  user-profile text that can include later reviews;
+- train-history items are masked before every validation/test top-k ranking.
+
+The data used here contains 2,998 interactions, 292 users, and 275 items. The
+validation grid searched \(\alpha \in \{0.2, 0.3\}\) and
+\(\lambda \in \{0.5, 0.75, 0.9\}\), with \(\gamma=0.99\) and
+\(\beta=1.0\). Validation selected \(\alpha=0.2\) and
+\(\lambda=0.75\), which gives \(M=55\) candidates on this catalog. The
+fixed setting was then evaluated across seeds 2020, 2021, and 2022 on test.
+
+| fixed test model | NDCG@10 | tail Recall@10 | coverage@10 |
+|---|---:|---:|---:|
+| IKGR adaptive gating + train-only CORONA + validation-selected rerank | **0.8617 ± 0.0080** | **0.9535** | **0.8024** |
+
+This is the current headline result for the smoke dataset. It remains a small,
+per-user temporal evaluation rather than evidence of production latency or
+generalization to the full Amazon Clothing catalog. A future hard 365-day
+filter should be applied inside each training split, not during global dataset
+construction.
+
 ## Run
 
 Minimal reusable run:

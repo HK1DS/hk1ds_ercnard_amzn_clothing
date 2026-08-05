@@ -146,7 +146,8 @@ def main():
             "--step2_csv", paths["step2_output"],
             "--vocab", rag["vocab_json"],
             "--emb", rag["encoding_npy"],
-            "--out", paths["kg_pack"]], env=env)
+            "--out", paths["kg_pack"],
+            "--metadata", metadata_csv if _csv_exists(metadata_csv) else ""], env=env)
 
         if _csv_exists(metadata_csv):
             meta_cmd = [

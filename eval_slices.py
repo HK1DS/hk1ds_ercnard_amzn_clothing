@@ -68,10 +68,14 @@ def _experiment_context(name, model_arg, extra, rb, paths, split):
         "spec": name,
         "model": model_arg if isinstance(model_arg, str) else model_arg.__name__,
         "split": split,
+        "eval_part": os.environ.get("IKGR_EVAL_PART", "test").lower(),
         "epochs": int(os.environ.get("IKGR_EPOCHS", rb["epochs"])),
         "embedding_size": int(os.environ.get("IKGR_EMBEDDING_SIZE", rb["embedding_size"])),
         "learning_rate": float(os.environ.get("IKGR_LEARNING_RATE", "1e-3")),
         "reg_weight": float(os.environ.get("IKGR_REG_WEIGHT", "1e-6")),
+        "adaptive_gamma": os.environ.get("IKGR_ADAPTIVE_GAMMA", "0.99"),
+        "entropy_beta": os.environ.get("IKGR_ENTROPY_BETA", "1.0"),
+        "corona_alpha": os.environ.get("IKGR_CORONA_ALPHA", "0.2"),
         "extra": extra,
         "paths": paths,
         "recbole": rb,
@@ -89,6 +93,13 @@ def _float_grid_from_env(name, default):
     if not values or any(value < 0 for value in values):
         raise ValueError(f"{name} must contain one or more non-negative floats")
     return values
+
+
+def _adaptive_candidate_m(n_items):
+    """Catalog-proportional CORONA candidate size, excluding the pad token."""
+    alpha = float(os.environ.get("IKGR_CORONA_ALPHA", "0.2"))
+    maximum = int(os.environ.get("IKGR_CORONA_M_MAX", "500"))
+    return max(1, min(maximum, int(math.floor(alpha * max(1, n_items - 1)))))
 
 
 def _config(rb, paths, extra, seed):
@@ -166,22 +177,38 @@ def _blend_rerank_scores(scores, graph_prior, score_scale, lam):
     return scores + lam * score_scale * graph_prior
 
 
-def _train_and_collect(model_arg, extra, rb, paths, seed):
+def _convex_rerank_scores(scores, graph_prior, lam):
+    """Candidate-local normalized (1-lambda) GNN + lambda prior fusion."""
+    if lam is None or lam == 0.0:
+        return scores
+    finite = torch.isfinite(scores)
+    lo = scores.masked_fill(~finite, float("inf")).min(dim=1, keepdim=True).values
+    hi = scores.masked_fill(~finite, float("-inf")).max(dim=1, keepdim=True).values
+    base = (scores - lo) / (hi - lo).clamp_min(1e-6)
+    fused = (1.0 - lam) * base + lam * graph_prior
+    return fused.masked_fill(~finite, float("-inf"))
+
+
+def _train_and_collect(model_arg, extra, rb, paths, seed, eval_part="test"):
     os.makedirs(os.path.join(paths.get("workdir", "run/"), "recbole_slice"), exist_ok=True)
     _set_determinism(seed)
     extra = dict(extra)
     # CORONA stage-3 (3-1): candidate-set restriction and soft reranking are
     # eval-only knobs, not model parameters, so pop them before building the
     # RecBole config. A rerank grid shares one trained model across lambdas.
-    cand_m = int(extra.pop("corona_cand", 0))
+    cand_m = extra.pop("corona_cand", 0)
     cand_cf = bool(extra.pop("corona_cf", True))
     cand_idf = bool(extra.pop("corona_idf", False))
     cand_popnorm = float(extra.pop("corona_popnorm", 0.0))
     cand_weights = extra.pop("corona_weights", None)
     rerank_lambdas = [float(x) for x in extra.pop("corona_rerank_grid", [])]
+    rerank_convex = bool(extra.pop("corona_rerank_convex", False))
     config = Config(model=model_arg, dataset=rb["dataset"], config_dict=_config(rb, paths, extra, seed))
     dataset = create_dataset(config)
     train_data, valid_data, test_data = data_preparation(config, dataset)
+    if cand_m == "adaptive":
+        cand_m = _adaptive_candidate_m(int(dataset.item_num))
+    cand_m = int(cand_m)
     klass = model_arg if not isinstance(model_arg, str) else get_model(config["model"])
     model = klass(config, train_data.dataset).to(config["device"])
     if getattr(model, "use_dynamic", False):
@@ -225,8 +252,9 @@ def _train_and_collect(model_arg, extra, rb, paths, seed):
     variants = [None] if not rerank_lambdas else rerank_lambdas
     per_user = {lam: [] for lam in variants}
     cand_rec_sum, cand_size_sum, cand_n = 0.0, 0, 0
+    eval_data = valid_data if eval_part == "valid" else test_data
     with torch.no_grad():
-        for interaction, history_index, positive_u, positive_i in test_data:
+        for interaction, history_index, positive_u, positive_i in eval_data:
             interaction = interaction.to(dev)
             users = interaction[uid_field]
             B = users.shape[0]
@@ -270,7 +298,8 @@ def _train_and_collect(model_arg, extra, rb, paths, seed):
             for r, it in zip(pu, pi):
                 rel_by_row.setdefault(int(r), []).append(int(it))
             for lam in variants:
-                rank_scores = _blend_rerank_scores(scores, graph_prior, score_scale, lam)
+                rank_scores = (_convex_rerank_scores(scores, graph_prior, lam)
+                               if rerank_convex else _blend_rerank_scores(scores, graph_prior, score_scale, lam))
                 topk = torch.topk(rank_scores, MAXK, dim=-1)[1].cpu().numpy()
                 for row in range(B):
                     rel = rel_by_row.get(row)
@@ -403,6 +432,8 @@ def main():
     meta = os.path.abspath(paths.get("meta_kg_pack", "run/meta_kg_pack.pt"))
     meta_extra = {"use_meta_kg": True, "meta_kg_path": meta} if os.path.exists(meta) else {}
     meta_path = meta if os.path.exists(meta) else None
+    adaptive_gamma = float(os.environ.get("IKGR_ADAPTIVE_GAMMA", "0.99"))
+    adaptive_beta = float(os.environ.get("IKGR_ENTROPY_BETA", "1.0"))
     all_specs = {
         "IKGR_kgoff":   (IKGRModel, {"use_kg": False}),
         "IKGR_kgon_L1": (IKGRModel, {"use_kg": True, "kg_pack_path": kg, "kg_layers": 1, "kg_cap": 32}),
@@ -415,6 +446,10 @@ def main():
                                          "intent_learnable": False, **meta_extra}),
         "IKGR_dyn": (IKGRModel, {"use_kg": True, "kg_pack_path": kg, "kg_layers": 1, "kg_cap": 32,
                                  "intent_learnable": False, "use_dynamic": True, **meta_extra}),
+        "IKGR_adaptive_dyn": (IKGRModel, {"use_kg": True, "kg_pack_path": kg, "kg_layers": 1, "kg_cap": 32,
+                                          "intent_learnable": False, "use_dynamic": True,
+                                          "adaptive_intent_gating": True, "recency_gamma": adaptive_gamma,
+                                          "entropy_beta": adaptive_beta, **meta_extra}),
         "IKGR_dyn_attn": (IKGRModel, {"use_kg": True, "kg_pack_path": kg, "kg_layers": 1, "kg_cap": 32,
                                       "intent_learnable": False, "use_dynamic": True,
                                       "profile_attn": True, **meta_extra}),
@@ -427,13 +462,13 @@ def main():
         # Same trained model as IKGR_dyn, but ranks within a retrieved candidate set.
         "IKGR_cand": (IKGRModel, {"use_kg": True, "kg_pack_path": kg, "kg_layers": 1, "kg_cap": 32,
                                   "intent_learnable": False, "use_dynamic": True,
-                                  "corona_cand": 500, "meta_kg_path": meta_path, **meta_extra}),
+                                  "corona_cand": "adaptive", "meta_kg_path": meta_path, **meta_extra}),
         # CORONA 3-1 de-biased: drop popularity-biased CF channel, IDF-weight
         # ubiquitous KG/meta nodes, and divide candidate scores by item_pop^0.5
         # to push long-tail/niche items into the candidate set (diversity-first).
         "IKGR_cand_db": (IKGRModel, {"use_kg": True, "kg_pack_path": kg, "kg_layers": 1, "kg_cap": 32,
                                      "intent_learnable": False, "use_dynamic": True,
-                                     "corona_cand": 500, "meta_kg_path": meta_path,
+                                     "corona_cand": "adaptive", "meta_kg_path": meta_path,
                                      "corona_cf": False, "corona_idf": True,
                                      "corona_popnorm": 0.5, **meta_extra}),
         # Soft CORONA reranking: preserve full-sort recall, then add a bounded
@@ -446,6 +481,22 @@ def main():
                                                "IKGR_CORONA_RERANK_GRID", [0.0, 0.1, 0.25, 0.5]),
                                            "corona_cf": False, "corona_idf": True,
                                            "corona_popnorm": 0.5, **meta_extra}),
+        "IKGR_adaptive_corona": (IKGRModel, {"use_kg": True, "kg_pack_path": kg, "kg_layers": 1, "kg_cap": 32,
+                                              "intent_learnable": False, "use_dynamic": True,
+                                              "adaptive_intent_gating": True, "recency_gamma": adaptive_gamma,
+                                              "entropy_beta": adaptive_beta, "meta_kg_path": meta_path,
+                                              "corona_cand": "adaptive", "corona_cf": False,
+                                              "corona_idf": True, "corona_popnorm": 0.5, **meta_extra}),
+        "IKGR_adaptive_corona_rerank": (IKGRModel, {"use_kg": True, "kg_pack_path": kg, "kg_layers": 1, "kg_cap": 32,
+                                                     "intent_learnable": False, "use_dynamic": True,
+                                                     "adaptive_intent_gating": True, "recency_gamma": adaptive_gamma,
+                                                     "entropy_beta": adaptive_beta, "meta_kg_path": meta_path,
+                                                     "corona_cand": "adaptive", "corona_cf": False,
+                                                     "corona_idf": True, "corona_popnorm": 0.5,
+                                                     "corona_rerank_convex": True,
+                                                     "corona_rerank_grid": _float_grid_from_env(
+                                                         "IKGR_CORONA_RERANK_GRID", [0.0, 0.1, 0.25, 0.5, 0.75]),
+                                                     **meta_extra}),
         "BPR":          ("BPR", {}),
         "LightGCN":     ("LightGCN", {}),
     }
@@ -455,10 +506,14 @@ def main():
     spec_names = os.environ.get("IKGR_SPECS", default_specs).split(",")
 
     split = os.environ.get("IKGR_SPLIT", str(pipe.get("split", "RS"))).upper()
+    eval_part = os.environ.get("IKGR_EVAL_PART", "test").lower()
+    if eval_part not in {"valid", "test"}:
+        raise ValueError("IKGR_EVAL_PART must be 'valid' or 'test'")
     os.environ.setdefault("IKGR_SPLIT", split)
     wd = paths.get("workdir", "run/")
     os.makedirs(wd, exist_ok=True)
-    fname = "slice_eval_result.json" if split == "RS" else f"slice_eval_{split}_result.json"
+    suffix = "" if eval_part == "test" else f"_{eval_part}"
+    fname = f"slice_eval_result{suffix}.json" if split == "RS" else f"slice_eval_{split}{suffix}_result.json"
     out_path = os.path.join(wd, fname)
     results = json.load(open(out_path, encoding="utf-8")) if os.path.exists(out_path) else {}
 
@@ -478,7 +533,9 @@ def main():
             if all(str(seed) in results[result_name]["seeds"] for result_name in result_names):
                 print(f"[skip] {name} seed={seed}", flush=True); continue
             print(f"\n===== {name} seed={seed} =====", flush=True)
-            pu_by_variant, pop, tsec, ni, cstats = _train_and_collect(model_arg, extra, rb, paths, seed)
+            pu_by_variant, pop, tsec, ni, cstats = _train_and_collect(
+                model_arg, extra, rb, paths, seed, eval_part=eval_part
+            )
             for lam, result_name in zip(([None] if not rerank_lambdas else rerank_lambdas), result_names):
                 rep = slice_report(pu_by_variant[lam], pop, ni); rep["train_sec"] = tsec
                 if cstats:

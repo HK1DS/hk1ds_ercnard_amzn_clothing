@@ -144,6 +144,9 @@ class IKGR(GeneralRecommender):
         self.kg_layers = int(_cfg(config, "kg_layers", 1))
         self.intent_learnable = bool(_cfg(config, "intent_learnable", True))
         self.kg_cap = int(_cfg(config, "kg_cap", 64))
+        self.adaptive_intent_gating = bool(_cfg(config, "adaptive_intent_gating", False))
+        self.recency_gamma = float(_cfg(config, "recency_gamma", 0.99))
+        self.entropy_beta = float(_cfg(config, "entropy_beta", 1.0))
         # Heterogeneous metadata KG (brand/category/attribute), LLM-free.
         self.use_meta_kg = bool(_cfg(config, "use_meta_kg", False))
         self.meta_kg_path = _cfg(config, "meta_kg_path", "run/meta_kg_pack.pt")
@@ -240,6 +243,33 @@ class IKGR(GeneralRecommender):
         ur, uc = edges(pack["user_intents"], u_tok2id)   # user<->intent edges
         ir, ic = edges(pack["item_intents"], i_tok2id)   # item<->intent edges
 
+        # Train-only adaptive W_{u,m,i}: recency decay times intent category
+        # specificity. This avoids temporal leakage: dataset is the train split.
+        uw = [1.0] * len(ur)
+        iw = [1.0] * len(ir)
+        if self.adaptive_intent_gating:
+            import collections
+            ent = pack.get("intent_category_entropy", torch.zeros(self.n_intents)).float()
+            spec = 1.0 / (1.0 + self.entropy_beta * ent)
+            inv_item = {v: k for k, v in i_tok2id.items()}
+            event_weights = collections.defaultdict(float)
+            inter = dataset.inter_feat
+            uf, itf = self.USER_ID, self.ITEM_ID
+            timestamps = inter["timestamp"].numpy() if "timestamp" in inter.columns else None
+            latest = collections.defaultdict(float)
+            if timestamps is not None:
+                for uid, ts in zip(inter[uf].numpy(), timestamps):
+                    latest[int(uid)] = max(latest[int(uid)], float(ts))
+            for n, (uid, iid) in enumerate(zip(inter[uf].numpy(), inter[itf].numpy())):
+                age = 0.0 if timestamps is None else max(0.0, (latest[int(uid)] - float(timestamps[n])) / 86400.0)
+                decay = self.recency_gamma ** age
+                token = inv_item.get(int(iid))
+                for intent in pack["item_intents"].get(str(token), []):
+                    event_weights[(int(uid), int(intent))] += decay * float(spec[int(intent)])
+            ur, uc, uw = zip(*[(u, m, w) for (u, m), w in event_weights.items()]) if event_weights else ([], [], [])
+            ur, uc, uw = list(ur), list(uc), list(uw)
+            iw = [float(spec[m]) for m in ic]
+
         def norm_coo(rows, cols, n_rows):
             """Row-normalized COO: value = 1/deg(row)."""
             rt = torch.tensor(rows, dtype=torch.long)
@@ -264,35 +294,42 @@ class IKGR(GeneralRecommender):
         # Padded intent-id tensors for FAST mini-batch L1 aggregation (gather the
         # batch's intent-node embeddings directly, avoiding a full-graph sparse
         # mm every step). Equivalent to Mu/Mi row-mean but only for batch rows.
-        def padded(rows, cols, n_rows, cap):
+        def padded(rows, cols, weights, n_rows, cap):
             from collections import defaultdict
             d = defaultdict(list)
-            for r, c in zip(rows, cols):
+            for r, c, w in zip(rows, cols, weights):
                 if len(d[r]) < cap:
-                    d[r].append(c)
+                    d[r].append((c, w))
             ids = torch.zeros(n_rows, cap, dtype=torch.long)
             mask = torch.zeros(n_rows, cap, dtype=torch.bool)
+            vals = torch.zeros(n_rows, cap, dtype=torch.float)
             for r, lst in d.items():
                 k = len(lst)
-                ids[r, :k] = torch.tensor(lst, dtype=torch.long)
+                ids[r, :k] = torch.tensor([x[0] for x in lst], dtype=torch.long)
                 mask[r, :k] = True
-            return ids, mask
-        ui, um = padded(ur, uc, self.n_users, self.kg_cap)
-        ii, im = padded(ir, ic, self.n_items, self.kg_cap)
+                raw_w = torch.tensor([x[1] for x in lst], dtype=torch.float)
+                vals[r, :k] = raw_w / raw_w.sum().clamp(min=1e-12)
+            return ids, mask, vals
+        ui, um, uw_buf = padded(ur, uc, uw, self.n_users, self.kg_cap)
+        ii, im, iw_buf = padded(ir, ic, iw, self.n_items, self.kg_cap)
         self.register_buffer("user_intent_ids", ui)
         self.register_buffer("user_intent_mask", um)
+        self.register_buffer("user_intent_weights", uw_buf)
         self.register_buffer("item_intent_ids", ii)
         self.register_buffer("item_intent_mask", im)
+        self.register_buffer("item_intent_weights", iw_buf)
         self._kg_ready = True
 
     def _sp(self, name, shape):
         return torch.sparse_coo_tensor(getattr(self, f"{name}_idx"),
                                        getattr(self, f"{name}_val"), shape)
 
-    def _agg(self, emb, ids_buf, mask_buf, rows):
+    def _agg(self, emb, ids_buf, mask_buf, rows, weights_buf=None):
         ids = ids_buf[rows]                                  # [B, cap]
         m = mask_buf[rows].unsqueeze(-1).float()             # [B, cap, 1]
         e = emb(ids) * m                                     # [B, cap, d]
+        if weights_buf is not None:
+            return (e * weights_buf[rows].unsqueeze(-1)).sum(1)
         return e.sum(1) / m.sum(1).clamp(min=1.0)            # [B, d]
 
     def _build_meta_kg(self, dataset):
@@ -359,7 +396,8 @@ class IKGR(GeneralRecommender):
             base = self._propagate()[0][uids]
         gated, raw = [], []
         if self.use_kg and self._kg_ready and self.kg_layers == 1:
-            v = self._agg(self.intent_embedding, self.user_intent_ids, self.user_intent_mask, uids)
+            v = self._agg(self.intent_embedding, self.user_intent_ids, self.user_intent_mask, uids,
+                          self.user_intent_weights)
             gated.append(self.intent_alpha * v); raw.append(v)
         if self.use_dynamic and self._recency_ready:
             rid = self.recency_item_ids[uids]
@@ -374,7 +412,8 @@ class IKGR(GeneralRecommender):
             return self._propagate()[1][iids]
         gated, raw = [], []
         if self.use_kg and self._kg_ready:
-            v = self._agg(self.intent_embedding, self.item_intent_ids, self.item_intent_mask, iids)
+            v = self._agg(self.intent_embedding, self.item_intent_ids, self.item_intent_mask, iids,
+                          self.item_intent_weights)
             gated.append(self.intent_alpha * v); raw.append(v)
         if self.use_meta_kg and self._meta_ready:
             if self._has_author:
@@ -394,7 +433,8 @@ class IKGR(GeneralRecommender):
         cf = self.dropout_layer(self.user_embedding(uids))
         kg = None
         if self.use_kg and self._kg_ready:
-            kg = self._agg(self.intent_embedding, self.user_intent_ids, self.user_intent_mask, uids)
+            kg = self._agg(self.intent_embedding, self.user_intent_ids, self.user_intent_mask, uids,
+                           self.user_intent_weights)
         dyn = None
         if self.use_dynamic and self._recency_ready:
             rid = self.recency_item_ids[uids]
@@ -408,7 +448,8 @@ class IKGR(GeneralRecommender):
         cf = self.dropout_layer(self.item_embedding(iids))
         parts = []
         if self.use_kg and self._kg_ready:
-            parts.append(self._agg(self.intent_embedding, self.item_intent_ids, self.item_intent_mask, iids))
+            parts.append(self._agg(self.intent_embedding, self.item_intent_ids, self.item_intent_mask, iids,
+                                   self.item_intent_weights))
         if self.use_meta_kg and self._meta_ready:
             if self._has_author:
                 parts.append(self._agg(self.author_embedding, self.item_author_ids, self.item_author_mask, iids))

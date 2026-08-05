@@ -80,6 +80,19 @@ def collect_events(review_path, users, min_rating):
     return events, snippets
 
 
+def filter_inactive_history(events, max_age_days):
+    """Keep only events within max_age_days of each user's latest event."""
+    if max_age_days <= 0:
+        return events
+    latest = {}
+    for uid, _, _, timestamp in events:
+        latest[uid] = max(latest.get(uid, timestamp), timestamp)
+    cutoff = max_age_days * 86400
+    filtered = [row for row in events if latest[row[0]] - row[3] <= cutoff]
+    print(f"  recency filter ({max_age_days}d): {len(events):,} -> {len(filtered):,} events", flush=True)
+    return filtered
+
+
 def iterative_core(events, user_k, item_k):
     current = events
     while True:
@@ -149,6 +162,8 @@ def main():
     parser.add_argument("--user-k", type=int, default=5)
     parser.add_argument("--item-k", type=int, default=3)
     parser.add_argument("--min-rating", type=float, default=4.0)
+    parser.add_argument("--max-age-days", type=int, default=0,
+                        help="global filter only; keep 0 for temporal evaluation to avoid look-ahead")
     parser.add_argument("--seed", type=int, default=2020)
     args = parser.parse_args()
 
@@ -159,6 +174,7 @@ def main():
 
     chosen = select_users(review_path, args.users, args.seed)
     events, snippets = collect_events(review_path, chosen, args.min_rating)
+    events = filter_inactive_history(events, args.max_age_days)
     events = iterative_core(events, args.user_k, args.item_k)
     valid_users = {row[0] for row in events}
     valid_items = {row[1] for row in events}
