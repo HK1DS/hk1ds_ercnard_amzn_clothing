@@ -147,6 +147,9 @@ class IKGR(GeneralRecommender):
         self.adaptive_intent_gating = bool(_cfg(config, "adaptive_intent_gating", False))
         self.recency_gamma = float(_cfg(config, "recency_gamma", 0.99))
         self.entropy_beta = float(_cfg(config, "entropy_beta", 1.0))
+        # Strict inductive mode: do not connect test-only items to KG nodes and
+        # compute intent category entropy from train items only.
+        self.train_only_kg = bool(_cfg(config, "train_only_kg", False))
         # Heterogeneous metadata KG (brand/category/attribute), LLM-free.
         self.use_meta_kg = bool(_cfg(config, "use_meta_kg", False))
         self.meta_kg_path = _cfg(config, "meta_kg_path", "run/meta_kg_pack.pt")
@@ -229,9 +232,19 @@ class IKGR(GeneralRecommender):
         u_tok2id = dataset.field2token_id[self.USER_ID]
         i_tok2id = dataset.field2token_id[self.ITEM_ID]
 
-        def edges(token_intents, tok2id):
+        train_item_tokens = None
+        if self.train_only_kg:
+            inv_item = {v: k for k, v in i_tok2id.items()}
+            train_item_tokens = {
+                str(inv_item[int(i)]) for i in dataset.inter_feat[self.ITEM_ID].numpy()
+                if int(i) in inv_item
+            }
+
+        def edges(token_intents, tok2id, allowed_tokens=None):
             rs, cs = [], []
             for tok, ids in token_intents.items():
+                if allowed_tokens is not None and str(tok) not in allowed_tokens:
+                    continue
                 rid = tok2id.get(str(tok))
                 if rid is None:
                     continue
@@ -241,7 +254,7 @@ class IKGR(GeneralRecommender):
             return rs, cs
 
         ur, uc = edges(pack["user_intents"], u_tok2id)   # user<->intent edges
-        ir, ic = edges(pack["item_intents"], i_tok2id)   # item<->intent edges
+        ir, ic = edges(pack["item_intents"], i_tok2id, train_item_tokens)   # item<->intent edges
 
         # Train-only adaptive W_{u,m,i}: recency decay times intent category
         # specificity. This avoids temporal leakage: dataset is the train split.
@@ -250,6 +263,22 @@ class IKGR(GeneralRecommender):
         if self.adaptive_intent_gating:
             import collections
             ent = pack.get("intent_category_entropy", torch.zeros(self.n_intents)).float()
+            if self.train_only_kg:
+                # Static metadata is allowed side information in transductive
+                # setups, but this strict path deliberately excludes test-item
+                # categories from the adaptive specificity statistic.
+                category_counts = [collections.Counter() for _ in range(self.n_intents)]
+                categories = pack.get("item_categories", {})
+                for token in train_item_tokens or ():
+                    for intent in pack["item_intents"].get(str(token), []):
+                        for category in categories.get(str(token), []):
+                            category_counts[int(intent)][str(category)] += 1
+                ent = torch.zeros(self.n_intents, dtype=torch.float32)
+                for intent_id, counts in enumerate(category_counts):
+                    if counts:
+                        p = torch.tensor(list(counts.values()), dtype=torch.float32)
+                        p = p / p.sum()
+                        ent[intent_id] = -(p * torch.log2(p + 1e-12)).sum()
             spec = 1.0 / (1.0 + self.entropy_beta * ent)
             inv_item = {v: k for k, v in i_tok2id.items()}
             event_weights = collections.defaultdict(float)

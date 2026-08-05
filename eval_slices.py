@@ -533,6 +533,25 @@ def main():
                                                      "corona_rerank_grid": _float_grid_from_env(
                                                          "IKGR_CORONA_RERANK_GRID", [0.0, 0.1, 0.25, 0.5, 0.75]),
                                                      **meta_extra}),
+        # Strict audit: build active item-intent adjacency and entropy weights
+        # from the train split only.  Use this before making test-set claims.
+        "IKGR_adaptive_corona_strict": (IKGRModel, {"use_kg": True, "kg_pack_path": kg, "kg_layers": 1, "kg_cap": 32,
+                                                     "intent_learnable": False, "use_dynamic": True,
+                                                     "adaptive_intent_gating": True, "recency_gamma": adaptive_gamma,
+                                                     "entropy_beta": adaptive_beta, "train_only_kg": True,
+                                                     "meta_kg_path": meta_path, "corona_cand": "adaptive",
+                                                     "corona_cf": False, "corona_idf": True,
+                                                     "corona_popnorm": 0.5, **meta_extra}),
+        "IKGR_adaptive_corona_rerank_strict": (IKGRModel, {"use_kg": True, "kg_pack_path": kg, "kg_layers": 1, "kg_cap": 32,
+                                                            "intent_learnable": False, "use_dynamic": True,
+                                                            "adaptive_intent_gating": True, "recency_gamma": adaptive_gamma,
+                                                            "entropy_beta": adaptive_beta, "train_only_kg": True,
+                                                            "meta_kg_path": meta_path, "corona_cand": "adaptive",
+                                                            "corona_cf": False, "corona_idf": True,
+                                                            "corona_popnorm": 0.5, "corona_rerank_convex": True,
+                                                            "corona_rerank_grid": _float_grid_from_env(
+                                                                "IKGR_CORONA_RERANK_GRID", [0.0, 0.1, 0.25, 0.5, 0.75]),
+                                                            **meta_extra}),
         "BPR":          ("BPR", {}),
         "LightGCN":     ("LightGCN", {}),
     }

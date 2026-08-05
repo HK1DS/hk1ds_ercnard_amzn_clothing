@@ -188,13 +188,13 @@ sample while intentionally trading some catalog coverage for retrieval speed.
 It is not an end-to-end serving benchmark: this repository evaluates the
 offline ranking path and does not yet provide a <10 ms vector-search service.
 
-## Leakage-Controlled Validation/Test Result (2026-08-05)
+## Leakage-Controlled Validation/Test Result (superseded audit, 2026-08-05)
 
 The earlier 2026-08-05 adaptive experiments were useful for implementation
 debugging, but their hyperparameters were explored repeatedly on the test
-split. They must therefore not be treated as final test estimates. This final
-pass used a separate validation loader to select candidate ratio and reranking
-weight, then evaluated the selected setting on the test loader once.
+split. They must therefore not be treated as final test estimates. The result
+below is retained only as historical context and is superseded by the strict
+train-only KG audit that follows.
 
 To avoid look-ahead from preprocessing, the global "within 365 days of each
 user's latest event" filter is disabled for temporal evaluation. That filter
@@ -208,6 +208,11 @@ and history masking remain train-only:
 - train-history items are masked before every validation/test top-k ranking.
 - the 365-day hard inactivity window is applied only after each seed's train
   split is created; in this run it retained 2,267 of 2,314 train interactions.
+
+The high rerank score in the historical table is **not a valid headline
+result**: the item-intent KG and category-entropy statistic could still include
+test-item metadata. That is transductive side information, but it does not
+meet the strict train-only protocol.
 
 The data used here contains 2,998 interactions, 292 users, and 275 items. The
 validation grid searched \(\alpha \in \{0.2, 0.3\}\) and
@@ -223,6 +228,24 @@ fixed setting was then evaluated across seeds 2020, 2021, and 2022 on test.
 This is the current headline result for the smoke dataset. It remains a small,
 per-user temporal evaluation rather than evidence of production latency or
 generalization to the full Amazon Clothing catalog.
+
+## Strict Train-only KG Leakage Audit (2026-08-05)
+
+Strict mode removes test-only item-intent KG edges and recomputes each intent's
+category entropy using only items present in the training split. User intent
+exposure, recency weights, the 365-day interaction window, and history masking
+are also train-only. As a direct diagnosis, the soft-prior weight is fixed at
+\(\lambda=0\), so ranking uses the learned GNN score only.
+
+| strict test diagnostic | NDCG@10 | tail Recall@10 | coverage@10 |
+|---|---:|---:|---:|
+| IKGR adaptive gating + strict train-only KG + \(\lambda=0\) | **0.3842 ± 0.0198** | **0.4973** | **0.8412** |
+
+This is the three-seed test diagnostic (0.3570, 0.3912, 0.4043) on 2,998
+interactions / 292 users / 275 items. It confirms that the anomalous 0.87
+score came from the prior/transductive path, not pure GNN ranking. The next
+valid experiment is a strict-mode validation-only \(\lambda\) sweep, followed
+by one locked test evaluation.
 
 ## Run
 

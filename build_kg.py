@@ -75,9 +75,17 @@ def main():
     nnz_u = sum(len(v) for v in user_intents.values())
     nnz_i = sum(len(v) for v in item_intents.values())
     entropy = torch.zeros(len(vocab), dtype=torch.float32)
+    # Keep the raw item->category mapping in the pack as well.  The model can
+    # then recompute entropy after the interaction split, using *train items
+    # only*, for strict inductive evaluations.
+    item_categories = {}
     if args.metadata and os.path.exists(args.metadata):
         meta = pd.read_csv(args.metadata, dtype=str).fillna("")
         category_by_item = dict(zip(meta["item_id"].astype(str), meta.get("category", "")))
+        item_categories = {
+            str(item): [x.strip() for x in str(category).split("|") if x.strip()]
+            for item, category in category_by_item.items()
+        }
         counts = [dict() for _ in vocab]
         for item, ids in item_intents.items():
             cats = [x.strip() for x in str(category_by_item.get(item, "")).split("|") if x.strip()]
@@ -97,6 +105,7 @@ def main():
             "item_intents": item_intents,
             "n_intents": len(vocab),
             "intent_category_entropy": entropy,
+            "item_categories": item_categories,
         },
         args.out,
     )
