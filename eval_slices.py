@@ -76,6 +76,7 @@ def _experiment_context(name, model_arg, extra, rb, paths, split):
         "adaptive_gamma": os.environ.get("IKGR_ADAPTIVE_GAMMA", "0.99"),
         "entropy_beta": os.environ.get("IKGR_ENTROPY_BETA", "1.0"),
         "corona_alpha": os.environ.get("IKGR_CORONA_ALPHA", "0.2"),
+        "train_max_age_days": os.environ.get("IKGR_TRAIN_MAX_AGE_DAYS", "365"),
         "extra": extra,
         "paths": paths,
         "recbole": rb,
@@ -170,6 +171,38 @@ def _build_recency(model, train_data, config):
     print(f"  [recency] built for {len(byu)} users from {len(u)} train inters (N={N})", flush=True)
 
 
+def _filter_train_by_recency(train_data, config, max_age_days):
+    """Apply the hard inactivity window inside each already-created train split.
+
+    The cutoff uses only a user's latest *training* timestamp, so validation and
+    test timestamps can never influence which training examples survive.
+    """
+    if max_age_days <= 0:
+        return train_data
+    inter = train_data.dataset.inter_feat
+    if "timestamp" not in inter.columns:
+        raise RuntimeError("train-only recency filter requires timestamp")
+    uf = config["USER_ID_FIELD"]
+    users, ts = inter[uf].numpy(), inter["timestamp"].numpy()
+    latest = {}
+    for uid, stamp in zip(users, ts):
+        latest[int(uid)] = max(latest.get(int(uid), float(stamp)), float(stamp))
+    cutoff = float(max_age_days) * 86400.0
+    keep = np.fromiter((latest[int(uid)] - float(stamp) <= cutoff for uid, stamp in zip(users, ts)),
+                       dtype=bool, count=len(users))
+    before = len(inter)
+    train_data.dataset.inter_feat = inter[torch.from_numpy(keep)]
+    kept = len(train_data.dataset.inter_feat)
+    if kept == 0:
+        raise RuntimeError("train-only recency filter removed every interaction")
+    # The original DataLoader has an index sampler sized for the unfiltered
+    # dataset. Recreate it so no stale indices can reach the smaller table.
+    rebuilt = train_data.__class__(config, train_data.dataset, train_data._sampler,
+                                   shuffle=config["shuffle"])
+    print(f"  [train-window] {max_age_days}d: {before} -> {kept} interactions", flush=True)
+    return rebuilt
+
+
 def _blend_rerank_scores(scores, graph_prior, score_scale, lam):
     """Apply a relative graph prior without altering the zero-lambda control."""
     if lam is None or lam == 0.0:
@@ -206,6 +239,9 @@ def _train_and_collect(model_arg, extra, rb, paths, seed, eval_part="test"):
     config = Config(model=model_arg, dataset=rb["dataset"], config_dict=_config(rb, paths, extra, seed))
     dataset = create_dataset(config)
     train_data, valid_data, test_data = data_preparation(config, dataset)
+    train_data = _filter_train_by_recency(
+        train_data, config, int(os.environ.get("IKGR_TRAIN_MAX_AGE_DAYS", "365"))
+    )
     if cand_m == "adaptive":
         cand_m = _adaptive_candidate_m(int(dataset.item_num))
     cand_m = int(cand_m)

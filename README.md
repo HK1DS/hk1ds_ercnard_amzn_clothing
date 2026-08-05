@@ -206,6 +206,8 @@ and history masking remain train-only:
 - CORONA constructs user intent exposure from train user-item history, not LLM
   user-profile text that can include later reviews;
 - train-history items are masked before every validation/test top-k ranking.
+- the 365-day hard inactivity window is applied only after each seed's train
+  split is created; in this run it retained 2,267 of 2,314 train interactions.
 
 The data used here contains 2,998 interactions, 292 users, and 275 items. The
 validation grid searched \(\alpha \in \{0.2, 0.3\}\) and
@@ -216,13 +218,11 @@ fixed setting was then evaluated across seeds 2020, 2021, and 2022 on test.
 
 | fixed test model | NDCG@10 | tail Recall@10 | coverage@10 |
 |---|---:|---:|---:|
-| IKGR adaptive gating + train-only CORONA + validation-selected rerank | **0.8617 ± 0.0080** | **0.9535** | **0.8024** |
+| IKGR adaptive gating + train-only 365-day window + CORONA + validation-selected rerank | **0.8756 ± 0.0103** | **0.9523** | **0.8109** |
 
 This is the current headline result for the smoke dataset. It remains a small,
 per-user temporal evaluation rather than evidence of production latency or
-generalization to the full Amazon Clothing catalog. A future hard 365-day
-filter should be applied inside each training split, not during global dataset
-construction.
+generalization to the full Amazon Clothing catalog.
 
 ## Run
 
