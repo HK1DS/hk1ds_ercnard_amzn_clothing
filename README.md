@@ -94,6 +94,145 @@ pipeline:
 ```
 
 Use `split: TO` only when `interactions.csv` includes `timestamp`.
+### Prepare Amazon Clothing 2018
+After downloading the two official gzip JSONL files under
+`data/amazon_clothing/raw/`, build a deterministic, affordable experiment
+sample without loading either raw file fully into memory:
+```bash
+python prepare_amazon_clothing.py --users 5000 --user-k 5 --item-k 3 --min-rating 4
+```
+
+This writes `data/profiles.csv`, `data/interactions.csv`, and
+`data/item_metadata.csv`. The candidate-user sample is selected by stable hash,
+then positive interactions are iteratively filtered to a user/item k-core.
+
+## Amazon Clothing Smoke Experiment (2026-08-04)
+
+The following is a reproducibility snapshot, **not a claim about the full
+Amazon Clothing dataset**. It used the deterministic sample created with:
+
+```bash
+python prepare_amazon_clothing.py --users 5000 --user-k 5 --item-k 3 --min-rating 4
+```
+
+This produced 2,998 positive interactions from 292 users and 275 items. We
+used a per-user time-ordered split (`TO`), 30 epochs, and seeds
+`2020,2021,2022`. Scores are mean ± standard deviation across seeds.
+
+| model | NDCG@10 | Recall@10 | tail Recall@10 | coverage@10 |
+|---|---:|---:|---:|---:|
+| BPR | 0.0301 ± 0.0028 | 0.0503 | 0.0422 | 0.9976 |
+| LightGCN | 0.0343 ± 0.0054 | 0.0648 | 0.0625 | 0.9988 |
+| IKGR kgoff | 0.0348 ± 0.0055 | 0.0659 | 0.0637 | 0.9988 |
+| IKGR intent KG | 0.0213 ± 0.0034 | 0.0381 | 0.0193 | 0.4582 |
+| IKGR + metadata KG | 0.1121 ± 0.0168 | 0.1682 | 0.1560 | 0.4243 |
+| IKGR DynLLM | 0.3117 ± 0.0307 | 0.4401 | 0.4423 | 0.7054 |
+| IKGR + CORONA soft rerank (λ=0.5) | **0.3753 ± 0.0251** | **0.5079** | **0.5114** | 0.7345 |
+
+The baseline grid searched embedding sizes 32/64/128 and learning rates
+0.0005/0.001. LightGCN selected 128 dimensions and learning rate 0.001; the
+final configuration retains 128 dimensions. In this small sample, intent-only
+KG propagation reduced accuracy and coverage, while metadata and train-only
+recency provided the meaningful gains.
+
+`IKGR_cand_db` is intentionally not listed as a distinct result: its candidate
+count was 500 while this sample contains only 275 items, so it did not restrict
+the ranking catalog and matched DynLLM. Re-evaluate candidate generation with a
+smaller M (for example 50–200) before making a CORONA candidate-retrieval
+claim.
+
+## Adaptive Recency-Intent CORONA Experiment (2026-08-05)
+
+This follow-up implements the offline/online design used for the current
+recommended pipeline. Before the k-core, each user's events older than 365 days
+from that user's latest retained event are removed. The resulting deterministic
+smoke dataset contains 2,016 positive interactions, 196 users, and 184 items.
+
+During each evaluation seed, adaptive weights are computed from the **train
+split only** to prevent temporal leakage:
+
+\[
+W_{u,m,i}=\gamma^{\Delta t_{u,i}}\frac{1}{1+\beta H_m},
+\]
+
+where \(\Delta t\) is measured in days from the user's latest training event,
+\(\gamma=0.99\), and \(H_m\) is the entropy of metadata categories associated
+with intent \(m\). The weighted user-to-intent aggregation is then consumed by
+the IKGR/DynLLM model. Category entropy is built offline in `build_kg.py`; the
+time component is built after RecBole creates each train split.
+
+For online-style CORONA coarse retrieval, candidate size is catalog
+proportional:
+
+\[
+M=\min(M_{max},\lfloor\alpha|I|\rfloor),\quad \alpha=0.2,\ M_{max}=500.
+\]
+
+On this 184-item catalog, this yields \(M=36\), followed by model ranking in
+the retrieved set. The `IKGR_adaptive_corona` retriever had candidate recall
+0.9794 at M=36 for seed 2020. Results use the same `TO`, 30-epoch, three-seed
+protocol as the preceding table.
+
+| model | NDCG@10 | Recall@10 | tail Recall@10 | coverage@10 |
+|---|---:|---:|---:|---:|
+| LightGCN | 0.0241 ± 0.0061 | 0.0565 | 0.0580 | 1.0000 |
+| IKGR DynLLM | 0.2625 ± 0.0258 | 0.3663 | 0.3586 | 0.7971 |
+| IKGR adaptive gating + DynLLM | 0.3417 ± 0.0321 | 0.4778 | 0.4692 | 0.8352 |
+| IKGR adaptive gating + CORONA M=36 | **0.4910 ± 0.0287** | **0.6364** | **0.6485** | 0.8044 |
+
+The candidate-restricted model improves ranking and tail recall on this smoke
+sample while intentionally trading some catalog coverage for retrieval speed.
+It is not an end-to-end serving benchmark: this repository evaluates the
+offline ranking path and does not yet provide a <10 ms vector-search service.
+
+The data used here contains 2,998 interactions, 292 users, and 275 items. The
+validation grid searched \(\alpha \in \{0.2, 0.3\}\) and
+\(\lambda \in \{0.5, 0.75, 0.9\}\), with \(\gamma=0.99\) and
+\(\beta=1.0\). Validation selected \(\alpha=0.2\) and
+\(\lambda=0.75\), which gives \(M=55\) candidates on this catalog. The
+fixed setting was then evaluated across seeds 2020, 2021, and 2022 on test.
+
+| fixed test model | NDCG@10 | tail Recall@10 | coverage@10 |
+|---|---:|---:|---:|
+| IKGR adaptive gating + train-only 365-day window + CORONA + validation-selected rerank | **0.8756 ± 0.0103** | **0.9523** | **0.8109** |
+
+This is the current headline result for the smoke dataset. It remains a small,
+per-user temporal evaluation rather than evidence of production latency or
+generalization to the full Amazon Clothing catalog.
+
+## Strict Train-only KG Leakage Audit (2026-08-05)
+
+Strict mode removes test-only item-intent KG edges and recomputes each intent's
+category entropy using only items present in the training split. User intent
+exposure, recency weights, the 365-day interaction window, and history masking
+are also train-only. As a direct diagnosis, the soft-prior weight is fixed at
+\(\lambda=0\), so ranking uses the learned GNN score only.
+
+| strict test diagnostic | NDCG@10 | tail Recall@10 | coverage@10 |
+|---|---:|---:|---:|
+| IKGR adaptive gating + strict train-only KG + \(\lambda=0\) | **0.3842 ± 0.0198** | **0.4973** | **0.8412** |
+
+This is the three-seed test diagnostic (0.3570, 0.3912, 0.4043) on 2,998
+interactions / 292 users / 275 items. It confirms that the anomalous 0.87
+score came from the prior/transductive path, not pure GNN ranking. The next
+valid experiment is a strict-mode validation-only \(\lambda\) sweep, followed
+by one locked test evaluation.
+
+## Final Strict Rerun (2026-08-05)
+
+The previous high-score section above is obsolete and should not be used. The
+final strict rerun uses train-only KG and CORONA matrices: test-item intent and
+metadata rows are excluded from every graph-prior computation.
+
+Validation selected \(\lambda=0.75\) from \(\{0, 0.1, 0.25, 0.5, 0.75\}\).
+That setting was locked and evaluated once on test over seeds 2020--2022.
+
+| final strict test model | NDCG@10 | tail Recall@10 | coverage@10 |
+|---|---:|---:|---:|
+| IKGR adaptive gating + strict train-only KG + CORONA (\(\lambda=0.75\)) | **0.3712 ± 0.0077** | **0.3795** | **0.7236** |
+
+Seed NDCG@10 values: 0.3702, 0.3641, 0.3794. This is the only current
+reportable result for this smoke dataset.
 
 ## Run
 

@@ -45,6 +45,26 @@ def _csv_exists(path):
     return bool(path) and os.path.exists(path) and os.path.getsize(path) > 0
 
 
+def require_inputs(steps, paths):
+    """Fail early with the exact missing dataset files for selected stages."""
+    required = []
+    if steps & {"B", "C", "D"}:
+        required.append(("profiles CSV", paths.get("input_csv")))
+    if steps & {"D", "E"}:
+        required.append(("interactions CSV", paths.get("inter_file")))
+    if "C" in steps and "B" not in steps:
+        required.append(("step1 output", paths.get("step1_output")))
+    if "D" in steps and "C" not in steps:
+        required.append(("step2 output", paths.get("step2_output")))
+    missing = [(label, path) for label, path in required if not _csv_exists(path)]
+    if missing:
+        details = "\n".join(f"  - {label}: {path or '<not configured>'}" for label, path in missing)
+        raise SystemExit(
+            "[preflight] Required input files are missing or empty:\n"
+            f"{details}\nPrepare the dataset or update paths in the config before running."
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -78,6 +98,8 @@ def main():
     pipeline = cfg.get("pipeline", {})
     meta_cfg = cfg.get("metadata", {})
     steps = set(args.steps.upper())
+
+    require_inputs(steps, paths)
 
     env = dict(os.environ)
     env["IKGR_CONFIG"] = args.config
@@ -124,7 +146,8 @@ def main():
             "--step2_csv", paths["step2_output"],
             "--vocab", rag["vocab_json"],
             "--emb", rag["encoding_npy"],
-            "--out", paths["kg_pack"]], env=env)
+            "--out", paths["kg_pack"],
+            "--metadata", metadata_csv if _csv_exists(metadata_csv) else ""], env=env)
 
         if _csv_exists(metadata_csv):
             meta_cmd = [

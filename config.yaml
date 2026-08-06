@@ -21,12 +21,11 @@ paths:
   meta_kg_pack: run/meta_kg_pack.pt
 
 llm:
-  # Default: Luxia Cloud OpenAI-compatible GPT-4o-mini bridge.
-  # Put the actual key in .env, not in this file.
-  base_url: https://bridge.luxiacloud.com/llm/openai/chat/completions/gpt-4o-mini
-  api_key: "${LUXIA_API_KEY}"
-  model: "llm"
-  provider: luxia
+  # Official OpenAI API. Keep the project key in .env, not this file.
+  base_url: https://api.openai.com/v1
+  api_key: "${OPENAI_API_KEY}"
+  model: "gpt-4o-mini"
+  provider: openai
   temperature: 0.2
   top_p: 0.95
   max_tokens: 2048
@@ -44,13 +43,15 @@ recbole:
   dataset: "ikgr-custom"
   topk: [10, 30]
   metrics: ["Recall", "MRR", "NDCG", "Hit", "Precision"]
-  epochs: 20
-  embedding_size: 512
+  # Tuned on the prepared Amazon Clothing sample (32/64/128 grid).
+  epochs: 30
+  embedding_size: 128
   dropout: 0.1
 
 pipeline:
   # Evaluation defaults. Use TO only when interactions include timestamp.
-  split: RS
+  # Amazon review data includes unixReviewTime, so evaluate future interactions.
+  split: TO
   seeds: "2020"
   specs: "IKGR_kgoff,IKGR_kgon_L1_frozen,BPR,LightGCN"
 
