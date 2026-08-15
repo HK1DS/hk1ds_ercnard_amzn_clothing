@@ -1,0 +1,37 @@
+data_contract:
+  source: Amazon Reviews 2018 Clothing, Shoes and Jewelry 5-core
+  positive_event: rating >= 4
+  deduplication: exact review rows
+  user_k: 5
+  item_k: 3
+  sampled_users: 50000
+  preprocessing_seed: 2020
+  max_age_days: 0
+paths:
+  raw_reviews: data/amazon_clothing/raw/Clothing_Shoes_and_Jewelry_5.json.gz
+  raw_metadata: data/amazon_clothing/raw/meta_Clothing_Shoes_and_Jewelry.json.gz
+  prepared: data/amazon_clothing/reporting/base
+llm:
+  base_url: https://bridge.luxiacloud.com/llm/openai/chat/completions/gpt-4o-mini
+  api_key: "${LUXIA_API_KEY}"
+  model: gpt-4o-mini
+  provider: luxia
+  temperature: 0.2
+  top_p: 0.95
+  max_tokens: 2048
+rag:
+  encoder: sentence-transformers/all-mpnet-base-v2
+  knn_k: 100
+recbole:
+  epochs: 12
+  embedding_size: 512
+  dropout: 0.1
+  topk: [10, 30]
+evaluation:
+  seeds: [2020, 2021, 2022]
+  candidate_m: 500
+  population_std_ddof: 0
+metadata:
+  columns: [brand, category, attributes, title, description]
+  missing_policy: retain item with empty metadata fields
+  availability_assumption: static catalog side information

@@ -98,6 +98,9 @@ def _float_grid_from_env(name, default):
 
 def _adaptive_candidate_m(n_items):
     """Catalog-proportional CORONA candidate size, excluding the pad token."""
+    fixed = os.environ.get("IKGR_CORONA_FIXED_M")
+    if fixed is not None:
+        return max(1, min(int(fixed), max(1, n_items - 1)))
     alpha = float(os.environ.get("IKGR_CORONA_ALPHA", "0.2"))
     maximum = int(os.environ.get("IKGR_CORONA_M_MAX", "500"))
     return max(1, min(maximum, int(math.floor(alpha * max(1, n_items - 1)))))
@@ -563,6 +566,20 @@ def main():
     spec_names = os.environ.get("IKGR_SPECS", default_specs).split(",")
 
     split = os.environ.get("IKGR_SPLIT", str(pipe.get("split", "RS"))).upper()
+    temporal = cfg.get("temporal", {})
+    if split in {"TO", "TO_GLOBAL"}:
+        expected_scope = "global_train" if split == "TO_GLOBAL" else "per_user_train"
+        if temporal.get("profile_scope") != expected_scope:
+            raise RuntimeError(f"{split} requires temporal.profile_scope={expected_scope}")
+        audit_path = temporal.get("profile_audit")
+        if not audit_path or not os.path.isfile(audit_path):
+            raise RuntimeError(f"{split} requires an existing temporal.profile_audit CSV")
+        import csv
+        with open(audit_path, encoding="utf-8-sig", newline="") as handle:
+            failed = [row.get("user_id") for row in csv.DictReader(handle)
+                      if row.get("within_train", "").lower() != "true"]
+        if failed:
+            raise RuntimeError(f"profile time audit failed for {len(failed)} users")
     eval_part = os.environ.get("IKGR_EVAL_PART", "test").lower()
     if eval_part not in {"valid", "test"}:
         raise ValueError("IKGR_EVAL_PART must be 'valid' or 'test'")
