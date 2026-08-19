@@ -111,6 +111,15 @@ def main():
         env["IKGR_SEEDS"] = args.seeds or str(pipeline.get("seeds"))
     if args.specs or pipeline.get("specs"):
         env["IKGR_SPECS"] = args.specs or str(pipeline.get("specs"))
+    for key, env_name in (
+        ("train_max_age_days", "IKGR_TRAIN_MAX_AGE_DAYS"),
+        ("candidate_m", "IKGR_CORONA_FIXED_M"),
+        ("candidate_recall", "IKGR_CANDIDATE_RECALL"),
+        ("rerank_grid", "IKGR_CORONA_RERANK_GRID"),
+    ):
+        if key in pipeline:
+            value = pipeline[key]
+            env[env_name] = ",".join(map(str, value)) if isinstance(value, list) else str(value)
 
     os.makedirs(paths["workdir"], exist_ok=True)
     dataset = args.dataset or rb["dataset"]

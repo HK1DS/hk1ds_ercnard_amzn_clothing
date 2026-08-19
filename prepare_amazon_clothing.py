@@ -13,6 +13,7 @@ import gzip
 import hashlib
 import heapq
 import json
+from datetime import datetime, timezone
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -64,20 +65,21 @@ def select_users(review_path, count, seed):
 
 def collect_events(review_path, users, min_rating):
     events = []
-    snippets = defaultdict(list)
     for index, row in enumerate(rows(review_path), 1):
         uid = str(row.get("reviewerID") or "")
         iid = str(row.get("asin") or "")
         rating = float(row.get("overall") or 0)
         timestamp = row.get("unixReviewTime")
         if uid in users and iid and timestamp is not None and rating >= min_rating:
-            events.append((uid, iid, rating, int(timestamp)))
             text = " ".join(str(row.get(key) or "").strip() for key in ("summary", "reviewText")).strip()
-            if text:
-                snippets[uid].append((int(timestamp), text[:600]))
+            events.append((uid, iid, rating, int(timestamp), text[:1200]))
         if index % 1_000_000 == 0:
             print(f"  pass2: {index:,} reviews, {len(events):,} retained", flush=True)
-    return events, snippets
+    # Exact duplicate review rows are not independent recommendation events.
+    # Preserve distinct repeat purchases/reviews at different timestamps.
+    deduped = list(dict.fromkeys(events))
+    print(f"  exact-event dedup: {len(events):,} -> {len(deduped):,}", flush=True)
+    return deduped
 
 
 def filter_inactive_history(events, max_age_days):
@@ -85,7 +87,7 @@ def filter_inactive_history(events, max_age_days):
     if max_age_days <= 0:
         return events
     latest = {}
-    for uid, _, _, timestamp in events:
+    for uid, _, _, timestamp, _ in events:
         latest[uid] = max(latest.get(uid, timestamp), timestamp)
     cutoff = max_age_days * 86400
     filtered = [row for row in events if latest[row[0]] - row[3] <= cutoff]
@@ -173,7 +175,7 @@ def main():
             raise SystemExit(f"Missing raw file: {path}")
 
     chosen = select_users(review_path, args.users, args.seed)
-    events, snippets = collect_events(review_path, chosen, args.min_rating)
+    events = collect_events(review_path, chosen, args.min_rating)
     events = filter_inactive_history(events, args.max_age_days)
     events = iterative_core(events, args.user_k, args.item_k)
     valid_users = {row[0] for row in events}
@@ -184,8 +186,9 @@ def main():
         print(f"  warning: {len(missing):,} items lack metadata; keeping them with ID-only text", flush=True)
 
     events.sort(key=lambda row: (row[0], row[3], row[1]))
-    write_csv(out / "interactions.csv", ["user_id", "item_id", "rating", "timestamp"], (
-        {"user_id": u, "item_id": i, "rating": r, "timestamp": t} for u, i, r, t in events
+    write_csv(out / "interactions.csv", ["user_id", "item_id", "rating", "timestamp", "review_text"], (
+        {"user_id": u, "item_id": i, "rating": r, "timestamp": t, "review_text": text}
+        for u, i, r, t, text in events
     ))
     meta_records = []
     for iid in sorted(valid_items):
@@ -194,10 +197,7 @@ def main():
     write_csv(out / "item_metadata.csv",
               ["item_id", "brand", "category", "attributes", "title", "description"], meta_records)
 
-    user_profiles = {}
-    for uid in valid_users:
-        recent = sorted(snippets.get(uid, []), reverse=True)[:5]
-        user_profiles[uid] = " ".join(text for _, text in recent)[:2400] or f"Amazon shopper {uid}"
+    user_profiles = {uid: f"Amazon shopper {uid}" for uid in valid_users}
     item_profiles = {}
     for row in meta_records:
         item_profiles[row["item_id"]] = " | ".join(filter(None, [
@@ -210,6 +210,29 @@ def main():
          "item_id": items[i % len(items)], "item_profile": item_profiles[items[i % len(items)]]}
         for i in range(n)
     ))
+    manifest = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "source": {
+            "reviews": str(review_path),
+            "metadata": str(meta_path),
+        },
+        "command": {
+            "users": args.users, "user_k": args.user_k, "item_k": args.item_k,
+            "min_rating": args.min_rating, "max_age_days": args.max_age_days, "seed": args.seed,
+        },
+        "policy": {
+            "positive_event": f"rating >= {args.min_rating}",
+            "deduplication": "exact (user,item,rating,timestamp,review_text) rows",
+            "timestamp": "unixReviewTime seconds since epoch",
+            "profile": "placeholder only; build_temporal_profiles.py creates train-only profiles",
+            "metadata": "static catalog side information; missing items retained with empty fields",
+        },
+        "counts": {"events": len(events), "users": len(users), "items": len(items),
+                   "metadata_matched": len(metadata), "metadata_missing": len(missing)},
+    }
+    (out / "prepare_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     print(f"[done] wrote {len(events):,} interactions, {len(users):,} users, {len(items):,} items to {out}")
 
 

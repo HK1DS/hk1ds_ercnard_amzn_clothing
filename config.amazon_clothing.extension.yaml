@@ -1,0 +1,15 @@
+purpose: validation-only Clothing tuning after primary results are locked
+base_config: config.amazon_clothing.to.yaml
+workdir: run/amazon_clothing_extension
+dataset: amazon-clothing-extension
+features:
+  X0: primary IKGR_full or IKGR_dyn reference
+  X1: adaptive intent gating only
+  X2: strict train-only item intent/meta KG only
+  X3: catalog-proportional candidate M only
+  X4: convex/de-biased rerank only
+  X5: X1+X2+X3+X4
+tuning:
+  selection_data: validation only
+  selection_seed: 2020
+  final_test_seeds: [2020, 2021, 2022]

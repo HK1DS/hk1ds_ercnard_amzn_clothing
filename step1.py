@@ -12,7 +12,7 @@ from ikgr_core.utils import read_csv, write_csv, ensure_dir
 # Number of concurrent LLM requests for intent extraction.
 # Conservative default to respect API rate limits; override via env var
 # (e.g. set IKGR_STEP1_WORKERS=12 if the provider allows higher throughput).
-MAX_WORKERS = int(os.environ.get("IKGR_STEP1_WORKERS", "8"))
+MAX_WORKERS = int(os.environ.get("IKGR_STEP1_WORKERS", "16"))
 
 def load_prompt(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
@@ -62,8 +62,10 @@ def main():
     p_user = load_prompt("prompts/step1_intents.txt")
     p_item = p_user  # same template
 
-    import json, time, requests
+    import json, time, requests, random
     cache_path = os.path.join(work, "step1_cache.json")
+    usage_path = os.path.join(work, "llm_usage.jsonl")
+    usage_lock = __import__("threading").Lock()
     if os.path.exists(cache_path):
         with open(cache_path, "r", encoding="utf-8") as f:
             cache = json.load(f)
@@ -88,15 +90,16 @@ def main():
                 status = e.response.status_code if e.response is not None else "unknown"
                 if status == 429:
                     print(f"\n[Rate Limit 429] Sleeping for {delay} seconds before retry (attempt {attempt+1}/{max_retries})...")
-                    time.sleep(delay)
+                    retry_after = e.response.headers.get("Retry-After") if e.response is not None else None
+                    time.sleep(float(retry_after) if retry_after else delay + random.random())
                     delay = min(delay * 2, 60)
                 else:
                     print(f"\n[HTTP Error {status}] Retrying in {delay} seconds...")
-                    time.sleep(delay)
+                    time.sleep(delay + random.random())
                     delay = min(delay * 2, 60)
             except Exception as e:
                 print(f"\n[Error] {e}. Retrying in {delay} seconds...")
-                time.sleep(delay)
+                time.sleep(delay + random.random())
                 delay = min(delay * 2, 60)
         return llm.chat(sys_prompt, prompt).strip()
 
@@ -124,6 +127,11 @@ def main():
         try:
             ans = chat_with_retry(sys_prompt, template.replace("{PROFILE}", key))
             parsed = str(parse_intent_list(ans))
+            record = {"timestamp": time.time(), "phase": "step1", "kind": kind,
+                      "profile_sha256": __import__("hashlib").sha256(key.encode()).hexdigest(),
+                      "usage": llm.usage(), "provider": llm.provider, "model": llm.model}
+            with usage_lock, open(usage_path, "a", encoding="utf-8") as ledger:
+                ledger.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception as e:
             # Don't cache on permanent failure -> it will be retried next run.
             print(f"\n[skip {kind}] permanent failure, will retry next run: {e}")

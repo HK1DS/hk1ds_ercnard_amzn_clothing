@@ -1,0 +1,7 @@
+purpose: connectivity-only; never use in primary comparison
+base_config: config.amazon_clothing.to.yaml
+overrides:
+  recbole_epochs: 1
+  recbole_embedding_size: 32
+  seeds: [2020]
+  specs: [IKGR_kgoff, BPR, LightGCN]

@@ -13,7 +13,7 @@ import re, ast, json
 
 # Number of concurrent LLM requests for RAG intent expansion.
 # Override via env var IKGR_STEP2_WORKERS if the provider allows more throughput.
-MAX_WORKERS = int(os.environ.get("IKGR_STEP2_WORKERS", "8"))
+MAX_WORKERS = int(os.environ.get("IKGR_STEP2_WORKERS", "32"))
 
 def load_prompt(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
@@ -85,19 +85,45 @@ def main():
     vocab = sorted(list(vocab))
     save_json(vocab, rag_cfg["vocab_json"])
 
-    # 2) Encode vocab + build Index
+    # 2) Encode vocab + build Index. Reuse only when the exact vocabulary,
+    # encoder and backend settings match; this saves several CPU minutes on
+    # every cache-resume cycle.
+    import hashlib
     enc = IntentEncoderIndex(rag_cfg["encoder"])
-    emb = enc.encode(vocab)
-    np.save(rag_cfg["encoding_npy"], emb)
-    enc.build_ann(emb, emb.shape[1], rag_cfg["annoy_trees"], rag_cfg["annoy_index"])
+    index_meta_path = os.path.join(paths["workdir"], "step2_vocab_index.json")
+    vocab_hash = hashlib.sha256(
+        json.dumps(vocab, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    expected_meta = {"vocab_sha256": vocab_hash, "count": len(vocab),
+                     "encoder": rag_cfg["encoder"], "annoy_trees": rag_cfg["annoy_trees"]}
+    reuse_index = False
+    if all(os.path.exists(path) for path in (rag_cfg["encoding_npy"], rag_cfg["annoy_index"], index_meta_path)):
+        try:
+            reuse_index = json.load(open(index_meta_path, encoding="utf-8")) == expected_meta
+        except Exception:
+            reuse_index = False
+    if reuse_index:
+        emb = np.load(rag_cfg["encoding_npy"], mmap_mode="r")
+        print(f"Loaded vocabulary index checkpoint: {len(vocab)} intents", flush=True)
+    else:
+        emb = enc.encode(vocab)
+        np.save(rag_cfg["encoding_npy"], emb)
+        enc.build_ann(emb, emb.shape[1], rag_cfg["annoy_trees"], rag_cfg["annoy_index"])
+        tmp_meta = index_meta_path + ".tmp"
+        with open(tmp_meta, "w", encoding="utf-8") as handle:
+            json.dump(expected_meta, handle, ensure_ascii=False, indent=2)
+        os.replace(tmp_meta, index_meta_path)
+        print(f"Saved vocabulary index checkpoint: {len(vocab)} intents", flush=True)
 
     ann = enc.load_ann(emb.shape[1], rag_cfg["annoy_index"])
     llm = LocalLLM(**llm_cfg)
     sys_prompt = "You are a helpful assistant that returns ONLY JSON lists of integers."
 
     # 3) For each row, expand related intents for user & item via RAG + LLM selection
-    import time, requests
+    import time, requests, random
     cache_path = os.path.join(paths["workdir"], "step2_cache.json")
+    usage_path = os.path.join(paths["workdir"], "llm_usage.jsonl")
+    usage_lock = __import__("threading").Lock()
     if os.path.exists(cache_path):
         with open(cache_path, "r", encoding="utf-8") as f:
             cache = json.load(f)
@@ -121,15 +147,16 @@ def main():
                 status = e.response.status_code if e.response is not None else "unknown"
                 if status == 429:
                     print(f"\n[Rate Limit 429] Sleeping for {delay} seconds before retry (attempt {attempt+1}/{max_retries})...")
-                    time.sleep(delay)
+                    retry_after = e.response.headers.get("Retry-After") if e.response is not None else None
+                    time.sleep(float(retry_after) if retry_after else delay + random.random())
                     delay = min(delay * 2, 60)
                 else:
                     print(f"\n[HTTP Error {status}] Retrying in {delay} seconds...")
-                    time.sleep(delay)
+                    time.sleep(delay + random.random())
                     delay = min(delay * 2, 60)
             except Exception as e:
                 print(f"\n[Error] {e}. Retrying in {delay} seconds...")
-                time.sleep(delay)
+                time.sleep(delay + random.random())
                 delay = min(delay * 2, 60)
         return llm.chat(sys_prompt, prompt).strip()
 
@@ -150,14 +177,17 @@ def main():
 
     # ---- Build pending job list (skip cached + dedup within a kind) ----
     exact_maps = {"user": user_exact_map, "item": item_exact_map}
-    jobs = []  # (kind, profile_key)
+    jobs = []  # pending (kind, profile_key)
+    all_jobs = []  # stable full profile universe for reusable embeddings
     seen = {"user": set(), "item": set()}
     for kind, profiles in (("user", unique_users), ("item", unique_items)):
         for prof in profiles:
             key = str(prof).strip()
-            if key and key not in cache[kind] and key not in seen[kind]:
+            if key and key not in seen[kind]:
                 seen[kind].add(key)
-                jobs.append((kind, key))
+                all_jobs.append((kind, key))
+                if key not in cache[kind]:
+                    jobs.append((kind, key))
 
     print(f"Pending RAG+LLM calls: {len(jobs)} | workers={MAX_WORKERS} "
           f"(cached users={len(cache['user'])}, items={len(cache['item'])})")
@@ -168,9 +198,64 @@ def main():
     # LLM calls inside threads.
     emb_map = {}
     if jobs:
-        all_profs = [key for _, key in jobs]
-        prof_embs = enc.encode(all_profs)
-        for (kind, key), e in zip(jobs, prof_embs):
+        all_profs = [key for _, key in all_jobs]
+        # Persist deterministic profile embeddings so interrupted large runs
+        # do not repeat the dominant CPU-only MPNet pass.
+        import hashlib
+        profile_emb_path = os.path.join(paths["workdir"], "step2_profile_emb.npy")
+        profile_emb_meta = os.path.join(paths["workdir"], "step2_profile_emb.json")
+        jobs_hash = hashlib.sha256(
+            json.dumps(all_jobs, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        prof_embs = None
+        if os.path.exists(profile_emb_path) and os.path.exists(profile_emb_meta):
+            try:
+                meta = json.load(open(profile_emb_meta, encoding="utf-8"))
+                if meta.get("jobs_sha256") == jobs_hash and meta.get("count") == len(all_jobs):
+                    loaded = np.load(profile_emb_path)
+                    if loaded.shape[0] == len(all_jobs):
+                        prof_embs = loaded
+                        print(f"Loaded profile embedding checkpoint: {profile_emb_path} {loaded.shape}")
+            except Exception as exc:
+                print(f"Ignoring invalid profile embedding checkpoint: {exc}")
+        if prof_embs is None:
+            tmp_emb = profile_emb_path + ".tmp"
+            progress_path = profile_emb_meta + ".progress"
+            completed = 0
+            if os.path.exists(tmp_emb) and os.path.exists(progress_path):
+                try:
+                    progress = json.load(open(progress_path, encoding="utf-8"))
+                    if progress.get("jobs_sha256") == jobs_hash and progress.get("count") == len(all_jobs):
+                        completed = int(progress.get("completed", 0))
+                except Exception:
+                    completed = 0
+            mode = "r+" if completed > 0 else "w+"
+            mapped = np.lib.format.open_memmap(
+                tmp_emb, mode=mode, dtype=np.float32, shape=(len(all_jobs), enc.dim)
+            )
+            chunk_size = int(os.environ.get("IKGR_PROFILE_EMB_CHUNK", "256"))
+            for start in range(completed, len(all_jobs), chunk_size):
+                end = min(start + chunk_size, len(all_jobs))
+                mapped[start:end] = enc.encode(all_profs[start:end])
+                mapped.flush()
+                tmp_progress = progress_path + ".tmp"
+                with open(tmp_progress, "w", encoding="utf-8") as handle:
+                    json.dump({"jobs_sha256": jobs_hash, "count": len(all_jobs),
+                               "completed": end}, handle)
+                os.replace(tmp_progress, progress_path)
+                print(f"Profile embeddings: {end}/{len(all_jobs)}", flush=True)
+            del mapped
+            os.replace(tmp_emb, profile_emb_path)
+            if os.path.exists(progress_path):
+                os.remove(progress_path)
+            prof_embs = np.load(profile_emb_path, mmap_mode="r")
+            tmp_meta = profile_emb_meta + ".tmp"
+            with open(tmp_meta, "w", encoding="utf-8") as handle:
+                json.dump({"jobs_sha256": jobs_hash, "count": len(all_jobs),
+                           "shape": list(prof_embs.shape)}, handle, indent=2)
+            os.replace(tmp_meta, profile_emb_meta)
+            print(f"Saved profile embedding checkpoint: {profile_emb_path} {prof_embs.shape}")
+        for (kind, key), e in zip(all_jobs, prof_embs):
             emb_map[(kind, key)] = e
 
     # ---- Concurrent expansion (thread-safe cache + periodic atomic save) ----
@@ -189,6 +274,11 @@ def main():
         prompt = p_rel.replace("{PROFILE}", key).replace("{OPTIONS}", options_text)
         try:
             ans = chat_with_retry(sys_prompt, prompt)
+            record = {"timestamp": time.time(), "phase": "step2", "kind": kind,
+                      "profile_sha256": __import__("hashlib").sha256(key.encode()).hexdigest(),
+                      "usage": llm.usage(), "provider": llm.provider, "model": llm.model}
+            with usage_lock, open(usage_path, "a", encoding="utf-8") as ledger:
+                ledger.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception as e:
             print(f"\n[skip {kind}] permanent failure, will retry next run: {e}")
             return

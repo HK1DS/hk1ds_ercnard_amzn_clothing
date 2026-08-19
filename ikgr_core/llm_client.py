@@ -1,11 +1,16 @@
 import os
 import re
 import requests
+import threading
+import time
 from typing import Dict, Optional
 
 class LocalLLM:
     _ENV_PATTERN = re.compile(r"^\$\{([^}]+)\}$")
     _DOTENV_LOADED = False
+    _REQUEST_LOCK = threading.Lock()
+    _NEXT_REQUEST_AT = 0.0
+    _THREAD_STATE = threading.local()
 
     def __init__(
         self,
@@ -83,11 +88,25 @@ class LocalLLM:
         return key
 
     def chat(self, system_prompt: str, user_prompt: str) -> str:
+        # A process-wide gate prevents worker bursts from overwhelming one API
+        # account. Set IKGR_LLM_MIN_INTERVAL_SEC to the provider-safe interval.
+        interval = float(os.environ.get("IKGR_LLM_MIN_INTERVAL_SEC", "0.15"))
+        with self._REQUEST_LOCK:
+            now = time.monotonic()
+            if now < self._NEXT_REQUEST_AT:
+                time.sleep(self._NEXT_REQUEST_AT - now)
+            type(self)._NEXT_REQUEST_AT = time.monotonic() + max(0.0, interval)
         if self.provider == "gemini":
             return self._chat_gemini(system_prompt, user_prompt)
         elif self.provider == "luxia":
             return self._chat_luxia(system_prompt, user_prompt)
         return self._chat_openai(system_prompt, user_prompt)
+
+    def usage(self) -> Dict:
+        return dict(getattr(self._THREAD_STATE, "usage", {}) or {})
+
+    def _capture_usage(self, data: Dict) -> None:
+        self._THREAD_STATE.usage = data.get("usage", {}) or {}
 
     def _chat_openai(self, system_prompt: str, user_prompt: str) -> str:
         url = f"{self.base_url}/chat/completions"
@@ -105,6 +124,7 @@ class LocalLLM:
         r = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
         r.raise_for_status()
         data = r.json()
+        self._capture_usage(data)
         return data["choices"][0]["message"]["content"]
 
     def _chat_luxia(self, system_prompt: str, user_prompt: str) -> str:
@@ -128,6 +148,7 @@ class LocalLLM:
         r = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
         r.raise_for_status()
         data = r.json()
+        self._capture_usage(data)
         return data["choices"][0]["message"]["content"]
 
     def _chat_gemini(self, system_prompt: str, user_prompt: str) -> str:
@@ -158,4 +179,10 @@ class LocalLLM:
         r = requests.post(url, json=payload, timeout=self.timeout)
         r.raise_for_status()
         data = r.json()
+        usage = data.get("usageMetadata", {})
+        self._THREAD_STATE.usage = {
+            "prompt_tokens": usage.get("promptTokenCount"),
+            "completion_tokens": usage.get("candidatesTokenCount"),
+            "total_tokens": usage.get("totalTokenCount"),
+        }
         return data["candidates"][0]["content"]["parts"][0]["text"]
