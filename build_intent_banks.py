@@ -17,7 +17,8 @@ Output format:
   }, path)
 """
 
-import argparse, ast, os
+import argparse, ast, json, os
+import numpy as np
 import torch
 import pandas as pd
 from sentence_transformers import SentenceTransformer
@@ -40,7 +41,7 @@ def _unique_keep_order(lst):
             out.append(x); seen.add(x)
     return out
 
-def build_banks(step2_csv, encoder_name, user_out, item_out):
+def build_banks(step2_csv, encoder_name, user_out, item_out, vocab_out=None, emb_out=None):
     df = pd.read_csv(step2_csv).fillna("")
     enc = SentenceTransformer(encoder_name)
 
@@ -73,6 +74,13 @@ def build_banks(step2_csv, encoder_name, user_out, item_out):
         show_progress_bar=True,
     ).cpu()  # [V, d]
     emb_map = {tok: emb_all[idx] for idx, tok in enumerate(vocab)}
+    if vocab_out:
+        os.makedirs(os.path.dirname(vocab_out), exist_ok=True)
+        with open(vocab_out, "w", encoding="utf-8") as f:
+            json.dump(vocab, f, ensure_ascii=False)
+    if emb_out:
+        os.makedirs(os.path.dirname(emb_out), exist_ok=True)
+        np.save(emb_out, emb_all.numpy())
 
     # --- Assemble per-token banks by stacking the relevant intent embeddings (order preserved)
     user_bank = {uid: torch.stack([emb_map[t] for t in ints]) for uid, ints in user_intents.items()}
@@ -95,9 +103,12 @@ def main():
     ap.add_argument("--encoder", default="sentence-transformers/all-mpnet-base-v2")
     ap.add_argument("--user_out", default="run/user_bank.pt")
     ap.add_argument("--item_out", default="run/item_bank.pt")
+    ap.add_argument("--vocab-out", default=None)
+    ap.add_argument("--emb-out", default=None)
     args = ap.parse_args()
 
-    build_banks(args.step2_csv, args.encoder, args.user_out, args.item_out)
+    build_banks(args.step2_csv, args.encoder, args.user_out, args.item_out,
+                args.vocab_out, args.emb_out)
 
 if __name__ == "__main__":
     main()
