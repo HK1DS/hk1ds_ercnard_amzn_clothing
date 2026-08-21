@@ -145,6 +145,9 @@ class IKGR(GeneralRecommender):
         self.intent_learnable = bool(_cfg(config, "intent_learnable", True))
         self.kg_cap = int(_cfg(config, "kg_cap", 64))
         self.adaptive_intent_gating = bool(_cfg(config, "adaptive_intent_gating", False))
+        # Optional static edge weighting. ``idf`` downweights intents connected
+        # to many entities; padded() subsequently normalizes weights per entity.
+        self.intent_edge_weighting = str(_cfg(config, "intent_edge_weighting", "uniform")).lower()
         self.recency_gamma = float(_cfg(config, "recency_gamma", 0.99))
         self.entropy_beta = float(_cfg(config, "entropy_beta", 1.0))
         # Strict inductive mode: do not connect test-only items to KG nodes and
@@ -260,6 +263,16 @@ class IKGR(GeneralRecommender):
         # specificity. This avoids temporal leakage: dataset is the train split.
         uw = [1.0] * len(ur)
         iw = [1.0] * len(ir)
+        if self.intent_edge_weighting == "idf":
+            import collections
+            def idf_weights(cols, n_entities):
+                df = collections.Counter(cols)
+                return [float(__import__("math").log((n_entities + 1.0) / (df[c] + 1.0)) + 1.0)
+                        for c in cols]
+            uw = idf_weights(uc, self.n_users)
+            iw = idf_weights(ic, self.n_items)
+        elif self.intent_edge_weighting != "uniform":
+            raise ValueError(f"Unknown intent_edge_weighting={self.intent_edge_weighting!r}")
         if self.adaptive_intent_gating:
             import collections
             ent = pack.get("intent_category_entropy", torch.zeros(self.n_intents)).float()

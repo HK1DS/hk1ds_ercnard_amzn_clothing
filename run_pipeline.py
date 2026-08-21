@@ -150,7 +150,9 @@ def main():
             "--step2_csv", paths["step2_output"],
             "--encoder", encoder,
             "--user_out", paths["user_bank_pt"],
-            "--item_out", paths["item_bank_pt"]], env=env)
+            "--item_out", paths["item_bank_pt"],
+            "--vocab-out", rag["vocab_json"],
+            "--emb-out", rag["encoding_npy"]], env=env)
         sh([PY, "build_kg.py",
             "--step2_csv", paths["step2_output"],
             "--vocab", rag["vocab_json"],

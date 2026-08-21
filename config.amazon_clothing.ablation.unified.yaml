@@ -1,0 +1,48 @@
+paths:
+  input_csv: data/amazon_clothing/reporting/to/profiles.csv
+  inter_file: data/amazon_clothing/reporting/to/interactions.csv
+  meta_file: data/amazon_clothing/reporting/to/item_metadata.csv
+  workdir: run/amazon_clothing_ablation/unified
+  step1_output: run/amazon_clothing_ablation/unified/unused_step1.csv
+  step2_output: run/amazon_clothing_ablation/unified/unified_intents.csv
+  kg_triples: run/amazon_clothing_ablation/unified/kg_triples.txt
+  recbole_dump: run/amazon_clothing_ablation/unified/recbole
+  user_bank_pt: run/amazon_clothing_ablation/unified/user_bank.pt
+  item_bank_pt: run/amazon_clothing_ablation/unified/item_bank.pt
+  kg_pack: run/amazon_clothing_ablation/unified/kg_pack.pt
+  meta_kg_pack: run/amazon_clothing_ablation/unified/meta_kg_pack.pt
+llm:
+  base_url: https://bridge.luxiacloud.com/llm/openai/chat/completions/gpt-4o-mini
+  api_key: "${LUXIA_API_KEY}"
+  model: gpt-4o-mini
+  provider: luxia
+  temperature: 0.2
+  top_p: 0.95
+  max_tokens: 2048
+rag:
+  encoder: sentence-transformers/all-mpnet-base-v2
+  annoy_trees: 50
+  knn_k: 100
+  encoding_npy: run/amazon_clothing_ablation/unified/intents_emb.npy
+  annoy_index: run/amazon_clothing_ablation/unified/intents.ann
+  vocab_json: run/amazon_clothing_ablation/unified/intent_vocab.json
+recbole:
+  model: IKGR
+  dataset: amazon-clothing-to
+  topk: [10, 30]
+  metrics: [Recall, MRR, NDCG, Hit, Precision]
+  epochs: 12
+  embedding_size: 512
+  dropout: 0.1
+pipeline:
+  split: TO
+  seeds: "2020,2021,2022"
+  specs: IKGR_full_hetero
+temporal:
+  profile_scope: per_user_train
+  profile_audit: data/amazon_clothing/reporting/to/profile_time_audit.csv
+metadata:
+  author_cols: [brand]
+  publisher_cols: []
+  tag_cols: [category, attributes]
+  missing_policy: retain_empty
